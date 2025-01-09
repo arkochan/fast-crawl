@@ -1,0 +1,168 @@
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+
+	"github.com/PuerkitoBio/goquery"
+)
+
+// Node represents a directory or file in the tree.
+type Node struct {
+	Id       int    // Unique ID for the node
+	Name     string // Name of the directory or file
+	Path     string // Full path (URL)
+	IsFile   bool   // True if the node represents a file
+	ParentId int    // Parent node ID
+}
+
+var (
+	globalId   int      = 0 // Global unique ID counter
+	ignoreList []string = []string{
+		"http://browsehappy.com",
+		"https://larsjung.de/h5ai/",
+		"..",
+		"?C=N;O=D",
+		"?C=M;O=A",
+		"?C=S;O=A",
+		"?C=D;O=A",
+	}
+	nodes      []Node               // List of all nodes
+	outputFile string = "nodes.txt" // Output file to store nodes
+)
+
+// fetchAndParse fetches an H5AI page and returns a list of links.
+func fetchAndParse(url string) ([]string, error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to fetch URL %s: %s", url, resp.Status)
+	}
+
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var links []string
+	doc.Find("a").Each(func(i int, s *goquery.Selection) {
+		href, exists := s.Attr("href")
+		if exists {
+			links = append(links, href)
+		}
+	})
+	return links, nil
+}
+
+// isDirectory checks if a URL is a directory based on trailing slash.
+func isDirectory(link string) bool {
+	return strings.HasSuffix(link, "/")
+}
+
+// contains checks if a slice contains a specific item.
+func contains(slice []string, item string) bool {
+	for _, v := range slice {
+		if v == item {
+			return true
+		}
+	}
+	return false
+}
+
+// traverse recursively traverses links to build the tree-like structure.
+func traverse(baseURL string, path string, parentId int) error {
+	links, err := fetchAndParse(baseURL + path)
+	if err != nil {
+		fmt.Printf("Failed to fetch URL %s: %v\n", baseURL, err)
+		return err
+	}
+
+	for _, link := range links {
+		if contains(ignoreList, link) {
+			continue
+		}
+
+		fullPath := baseURL + link
+		fmt.Println("baseURLis", baseURL)
+		fmt.Println("link", link)
+		isDir := isDirectory(link)
+		globalId++
+		node := Node{
+			Id:       globalId,
+			Name:     link,
+			Path:     fullPath,
+			IsFile:   !isDir,
+			ParentId: parentId,
+		}
+		nodes = append(nodes, node)
+
+		// Recursively traverse directories
+		if isDir {
+			traverse(baseURL, link, node.Id)
+		}
+	}
+	return nil
+}
+
+// writeNodesToFile writes all nodes to a file with each node on a new line.
+func writeNodesToFile(filename string) error {
+	file, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	for _, node := range nodes {
+		line := fmt.Sprintf("%d###%s###%s###%t###%d\n", node.Id, node.Name, node.Path, node.IsFile, node.ParentId)
+		_, err := file.WriteString(line)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func main() {
+	linkQueue := make(chan string, 100)
+	var wg sync.WaitGroup
+	numWorkers := 10
+	// Base URLs to process
+	initialURLs := []string{}
+
+	for i := 1; i < 20; i++ {
+		baseURL := "http://ftp" + strconv.Itoa(i) + ".circleftp.net"
+		err := traverse(baseURL, "", 0) // Root has parentId = 0
+		if err != nil {
+			fmt.Printf("Failed to process base URL %s: %v\n", baseURL, err)
+		}
+	}
+	nodeId := 0
+
+	for _, link := range initialURLs {
+		linkQueue <- link
+		nodeId++
+	}
+
+	close(linkQueue)
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go worker(i, taskQueue, &wg)
+	}
+	wg.Wait()
+	fmt.Println("All tasks completed.")
+	// Write all nodes to the output file
+	err := writeNodesToFile(outputFile)
+	if err != nil {
+		fmt.Printf("Failed to write nodes to file: %v\n", err)
+	} else {
+		fmt.Printf("Nodes written to file: %s\n", outputFile)
+	}
+}
