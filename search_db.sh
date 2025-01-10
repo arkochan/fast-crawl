@@ -1,7 +1,7 @@
 #!/bin/bash
 # search_and_stream.sh
 
-files="data.db.part0 data.db.part1 data.db.part3 data.db.part4"
+files="data.db.part0 data.db.part1 data.db.part2 data.db.part3"
 
 # Define a function to check for VLC versions
 determine_vlc() {
