@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -22,7 +21,8 @@ import (
 
 // Config holds the crawler configuration
 type Config struct {
-	NumWorkers     int
+	NumCrawlers    int
+	NumWriters     int
 	QueueSize      int
 	InitialLinks   []string
 	ProcessTimeout time.Duration
@@ -48,13 +48,39 @@ type LinkData struct {
 type Crawler struct {
 	config     Config
 	linkQueue  chan LinkData
-	wg         sync.WaitGroup
+	wgCrawler  sync.WaitGroup
+	wgWtiter   sync.WaitGroup
 	seen       *sync.Map
 	idCounter  *int64
 	ctx        context.Context
 	cancel     context.CancelFunc
 	errorsChan chan error
 	nodes      chan Node
+	st         SafeTime
+}
+
+type SafeTime struct {
+	mu   sync.Mutex
+	time time.Time
+}
+
+func (s *SafeTime) TryWrite() {
+	if s.mu.TryLock() {
+		defer s.mu.Unlock()
+		// Simulate some work
+		s.time = time.Now()
+		// fmt.Println("Time written:", s.time)
+	} else {
+		// fmt.Println("Skipped writing, mutex is locked")
+	}
+}
+
+func (s *SafeTime) GetDelay() float64 {
+	return time.Since(s.time).Seconds()
+}
+
+func (c *Crawler) log(id int64) {
+	fmt.Printf("Processed: %d/ Total added: %d\n", id, *c.idCounter)
 }
 
 // NewCrawler creates a new crawler instance
@@ -67,9 +93,44 @@ func NewCrawler(config Config) *Crawler {
 		idCounter:  new(int64),
 		ctx:        ctx,
 		cancel:     cancel,
-		errorsChan: make(chan error, config.NumWorkers),
-		nodes:      make(chan Node),
+		errorsChan: make(chan error, config.NumCrawlers+config.NumWriters),
+		nodes:      make(chan Node, config.QueueSize),
+		st:         SafeTime{time: time.Now()},
 	}
+}
+
+func (c *Crawler) MergeFiles() {
+	// merge all the files created by writers
+	var files []string
+	for i := 0; i < c.config.NumWriters; i++ {
+		files = append(files, c.config.filename+".part"+strconv.Itoa(i))
+	}
+
+	outputFile, err := os.Create(c.config.filename)
+	if err != nil {
+		log.Fatalf("Failed to create output file: %v", err)
+	}
+	defer outputFile.Close()
+
+	for _, file := range files {
+		partFile, err := os.Open(file)
+		if err != nil {
+			log.Fatalf("Failed to open part file %s: %v", file, err)
+		}
+
+		_, err = io.Copy(outputFile, partFile)
+		if err != nil {
+			log.Fatalf("Failed to copy part file %s: %v", file, err)
+		}
+
+		partFile.Close()
+	}
+	// for _, file := range files {
+	// 	err := os.Remove(file)
+	// 	if err != nil {
+	// 		log.Printf("Failed to remove part file %s: %v", file, err)
+	// 	}
+	// }
 }
 
 // Start begins the crawling process
@@ -78,19 +139,21 @@ func (c *Crawler) Start() error {
 	go c.handleErrors()
 
 	// Start workers
-	for i := 0; i < c.config.NumWorkers; i++ {
-		c.wg.Add(1)
-		go c.worker(i)
+	for i := 0; i < c.config.NumCrawlers; i++ {
+		c.wgCrawler.Add(1)
+		go c.crawl(i)
 	}
-
-	go c.writeNodesToFile()
+	for i := 0; i < c.config.NumWriters; i++ {
+		c.wgWtiter.Add(1)
+		go c.writeNodes(i)
+	}
 	// Add initial links
 	for _, initialLinkString := range c.config.InitialLinks {
 		link := LinkData{
 			BaseURL:  initialLinkString,
 			Path:     "",
 			ParentId: 0,
-			Id:       atomic.AddInt64(c.idCounter, 1),
+			Id:       c.getNewId(),
 		}
 		select {
 		case c.linkQueue <- link:
@@ -99,20 +162,40 @@ func (c *Crawler) Start() error {
 			return fmt.Errorf("crawler stopped while adding initial links")
 		}
 	}
+	c.wgCrawler.Wait()
+	fmt.Println("Crawling done")
 
+	close(c.nodes)
+	c.wgWtiter.Wait()
+	fmt.Println("Writing done")
+
+	c.MergeFiles()
+	fmt.Println("Merging done")
 	// Handle graceful shutdown
 	c.handleShutdown()
 
-	// Wait for completion
-	c.wg.Wait()
-	close(c.nodes)
 	close(c.errorsChan)
 
 	return nil
 }
 
-func (c *Crawler) worker(id int) {
-	defer c.wg.Done()
+func (c *Crawler) writeNodes(id int) {
+	defer c.wgWtiter.Done()
+	f, err := os.Create(c.config.filename + ".part" + strconv.Itoa(id))
+	if err != nil {
+		log.Fatalf("Error creating file: %v", err)
+	}
+	defer f.Close()
+	for node := range c.nodes {
+		fmt.Fprintf(f, "%d###%s###%s###%t###%d\n", node.Id, node.Name, node.Path, node.IsFile, node.ParentId)
+		if err != nil {
+			log.Fatalf("Error writing to file: %v", err)
+		}
+	}
+}
+
+func (c *Crawler) crawl(id int) {
+	defer c.wgCrawler.Done()
 
 	for {
 		select {
@@ -122,6 +205,7 @@ func (c *Crawler) worker(id int) {
 			if !ok {
 				return
 			}
+			c.st.TryWrite()
 			if err := c.processLink(link); err != nil {
 				select {
 				case c.errorsChan <- fmt.Errorf("worker %d error: %v", id, err):
@@ -129,8 +213,18 @@ func (c *Crawler) worker(id int) {
 					log.Printf("Error channel full, dropping error: %v", err)
 				}
 			}
+		default:
+			// HACK:
+			if c.st.GetDelay() > c.config.ProcessTimeout.Seconds()+10 {
+				c.cancel()
+				fmt.Printf("Idle for more than %f seconds.", c.config.ProcessTimeout.Seconds()+10)
+			}
 		}
 	}
+}
+
+func isIntegral(val float64) bool {
+	return val == float64(int(val))
 }
 
 func (c *Crawler) processLink(link LinkData) error {
@@ -151,6 +245,9 @@ func (c *Crawler) processLink(link LinkData) error {
 		return fmt.Errorf("processing link %s: %v", link, err)
 	}
 	// Add new links in a separate goroutine
+	if link.Id%1000 == 0 {
+		c.log(link.Id)
+	}
 	go c.addNewLinks(newLinks)
 
 	return nil
@@ -192,7 +289,7 @@ func filter[T any](ss []T, test func(T) bool) (in []T, out []T) {
 			out = append(out, s)
 		}
 	}
-	return
+	return in, out
 }
 
 func contain(link LinkData) bool {
@@ -205,9 +302,7 @@ func contain(link LinkData) bool {
 		"ip.php",
 	}
 	for _, v := range ignoreList {
-		if v == link.Path {
-			return true
-		}
+		return strings.HasSuffix(link.Path, v)
 	}
 	return false
 }
@@ -330,201 +425,30 @@ func (c *Crawler) extractLinks(link LinkData) ([]LinkData, error) {
 				BaseURL:  link.BaseURL,
 				Path:     href,
 				ParentId: link.Id,
-				Id:       atomic.AddInt64(c.idCounter, 1),
+				Id:       c.getNewId(),
 			})
 		}
 	})
 	return links, nil
 }
 
-func (c *Crawler) writeToFile(node Node) error {
-	// Open the file in append mode, create it if it doesn't exist
-	file, err := os.OpenFile("output.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to open file: %w", err)
-	}
-	defer file.Close()
-
-	// Write node information to the file
-	_, err = fmt.Fprintf(file, "%d###%s###%s###%t###%d\n",
-		node.Id, node.Name, node.Path, node.IsFile, node.ParentId)
-	if err != nil {
-		return fmt.Errorf("failed to write to file: %w", err)
-	}
-
-	return nil
-}
-
-func (c *Crawler) writeNodesToFile() {
-	const (
-		bufferSize = 1024 * 1024 * 8 // 8MB buffer per writer
-		batchSize  = 10000           // Nodes per batch
-		numWriters = 4               // Number of concurrent writers
-	)
-
-	var wg sync.WaitGroup
-	nodeChannels := make([]chan Node, numWriters)
-
-	// Create buffered channels for each writer
-	for i := range nodeChannels {
-		nodeChannels[i] = make(chan Node, batchSize)
-	}
-
-	// Start multiple writer goroutines
-	for i := 0; i < numWriters; i++ {
-		wg.Add(1)
-		go func(writerNum int, nodeChan chan Node) {
-			defer wg.Done()
-
-			filename := fmt.Sprintf("%s.part%d", c.config.filename, writerNum)
-			file, err := os.OpenFile(filename,
-				os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-			if err != nil {
-				log.Printf("Writer %d failed to open file: %v", writerNum, err)
-				return
-			}
-			defer file.Close()
-
-			writer := bufio.NewWriterSize(file, bufferSize)
-			defer writer.Flush()
-
-			batch := make([]Node, 0, batchSize)
-
-			for node := range nodeChan {
-				batch = append(batch, node)
-
-				if len(batch) >= batchSize {
-					for _, n := range batch {
-						fmt.Fprintf(writer, "%d###%s###%s###%t###%d\n",
-							n.Id, n.Name, n.Path, n.IsFile, n.ParentId)
-					}
-					batch = batch[:0]
-				}
-			}
-
-			// Write remaining nodes in batch
-			for _, n := range batch {
-				fmt.Fprintf(writer, "%d###%s###%s###%t###%d\n",
-					n.Id, n.Name, n.Path, n.IsFile, n.ParentId)
-			}
-			writer.Flush()
-		}(i, nodeChannels[i])
-	}
-
-	// Distribute nodes across writers
-	nodeCount := 0
-	for node := range c.nodes {
-		writerIndex := nodeCount % numWriters
-		nodeChannels[writerIndex] <- node
-		nodeCount++
-	}
-
-	// Close all channels
-	for _, ch := range nodeChannels {
-		close(ch)
-	}
-
-	// Wait for all writers to finish
-	wg.Wait()
-
-	// Merge files at the end
-	c.mergeFiles(numWriters)
-}
-
-func (c *Crawler) mergeFiles(numParts int) error {
-	finalFile, err := os.Create(c.config.filename)
-	if err != nil {
-		return fmt.Errorf("failed to create final file: %v", err)
-	}
-	defer finalFile.Close()
-
-	writer := bufio.NewWriterSize(finalFile, 1024*1024*8)
-	defer writer.Flush()
-
-	// Calculate total size for progress reporting
-	var totalSize int64
-	for i := 0; i < numParts; i++ {
-		partFilename := fmt.Sprintf("%s.part%d", c.config.filename, i)
-		if info, err := os.Stat(partFilename); err == nil {
-			totalSize += info.Size()
-		}
-	}
-
-	var processedSize int64
-	for i := 0; i < numParts; i++ {
-		partFilename := fmt.Sprintf("%s.part%d", c.config.filename, i)
-
-		partFile, err := os.OpenFile(partFilename, os.O_RDONLY, 0644)
-		if err != nil {
-			return fmt.Errorf("failed to open part file %s: %v", partFilename, err)
-		}
-
-		reader := bufio.NewReaderSize(partFile, 1024*1024*8)
-
-		// Create a progress-tracking reader
-		// partSize, _ := partFile.Seek(0, io.SeekEnd)
-		partFile.Seek(0, io.SeekStart)
-
-		// Copy with progress tracking
-		copied, err := io.Copy(writer, io.TeeReader(reader, &progressWriter{
-			processed: &processedSize,
-			total:     totalSize,
-		}))
-
-		partFile.Close()
-
-		if err != nil {
-			return fmt.Errorf("failed to copy from part file %s: %v", partFilename, err)
-		}
-
-		log.Printf("Merged part %d/%d (%.2f MB)", i+1, numParts, float64(copied)/1024/1024)
-
-		if err := os.Remove(partFilename); err != nil {
-			log.Printf("Warning: failed to remove part file %s: %v", partFilename, err)
-		}
-	}
-
-	if err := writer.Flush(); err != nil {
-		return fmt.Errorf("failed to flush final file: %v", err)
-	}
-
-	log.Printf("Merge completed: %.2f MB total", float64(totalSize)/1024/1024)
-	return nil
-}
-
-// progressWriter tracks copy progress
-type progressWriter struct {
-	processed *int64
-	total     int64
-	lastLog   time.Time
-}
-
-func (pw *progressWriter) Write(p []byte) (int, error) {
-	n := len(p)
-	atomic.AddInt64(pw.processed, int64(n))
-
-	// Log progress every second
-	if time.Since(pw.lastLog) > time.Second {
-		progress := float64(*pw.processed) / float64(pw.total) * 100
-		log.Printf("Merging progress: %.1f%% (%.2f/%.2f MB)",
-			progress,
-			float64(*pw.processed)/1024/1024,
-			float64(pw.total)/1024/1024)
-		pw.lastLog = time.Now()
-	}
-
-	return n, nil
+func (c *Crawler) getNewId() int64 {
+	return atomic.AddInt64(c.idCounter, 1)
 }
 
 func main() {
 	initialURLs := []string{}
 
-	for i := 1; i < 20; i++ {
+	for i := 1; i < 18; i++ {
+		if i == 2 {
+			continue
+		}
 		baseURL := "http://ftp" + strconv.Itoa(i) + ".circleftp.net"
 		initialURLs = append(initialURLs, baseURL)
 	}
 	config := Config{
-		NumWorkers:     30,
+		NumCrawlers:    50,
+		NumWriters:     40,
 		QueueSize:      300,
 		ProcessTimeout: 20 * time.Second,
 		InitialLinks:   initialURLs,
