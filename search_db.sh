@@ -22,14 +22,6 @@ determine_vlc() {
 # Get the VLC command
 vlc_command=$(determine_vlc)
 
-local preview='
-      echo "Selected Entry:"
-      echo "ID: $(echo {} | awk -F "###" "{print \$1}")"
-      echo "Name: $(echo {} | awk -F "###" "{print \$2}")"
-      echo "Path: $(echo {} | awk -F "###" "{print \$3}")"
-      echo "Is File: $(echo {} | awk -F "###" "{print \$4}")"
-      echo "Parent ID: $(echo {} | awk -F "###" "{print \$5}")"
-    '
 # Function to play a file
 play_file() {
   local file_path=$1
