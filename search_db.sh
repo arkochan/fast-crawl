@@ -63,7 +63,9 @@ elif [ "$1" == "-v" ]; then
     '
     )
     if [ -n "$next_file" ]; then
-      play_file "$next_file"
+
+      file_path=$(echo "$next_file" | awk -F '###' '{print $3}')
+      play_file $file_path
     else
       echo "No next file available."
       exit 1
