@@ -41,6 +41,7 @@ if [ "$1" == "-c" ]; then
   if [ -f .history ]; then
     last_played=$(cat .history)
     play_file "$last_played"
+    exit 0
   else
     echo "No history available."
     exit 1
