@@ -1,3 +1,4 @@
 /db/*
 .history
 .history_siblings
+result/*
